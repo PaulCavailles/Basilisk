@@ -47,5 +47,3 @@ src/moduleTemplates/autoCppModule/*
 
 **/tests/report/
 **/__pycache__/
-venv/
-.venv/
