@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from Basilisk.fswAlgorithms import (mrpFeedback, attTrackingError,
+from Basilisk.fswAlgorithms import (mrpFeedback, attTrackingError,hillPoint,
                                     inertial3D, rwMotorTorque,
                                     tamComm, mtbMomentumManagementSimple, 
                                     torque2Dipole, dipoleMapping, 
@@ -10,6 +10,7 @@ from Basilisk.utilities import SimulationBaseClass
 from Basilisk.utilities import macros
 from Basilisk.utilities import simSetPlanetEnvironment
 from Basilisk.utilities import unitTestSupport 
+from Basilisk.utilities import RigidBodyKinematics
 from Basilisk.utilities import simIncludeRW
 from Basilisk.utilities import (orbitalMotion,simIncludeGravBody)
 
@@ -21,6 +22,7 @@ from Basilisk.simulation import exponentialAtmosphere
 from Basilisk.simulation import GravityGradientEffector
 from Basilisk.simulation import starTracker
 from Basilisk.simulation import reactionWheelStateEffector
+from Basilisk.simulation import extForceTorque
 
 from Basilisk.simulation import radiationPressure
 
@@ -42,6 +44,70 @@ from Basilisk.utilities import vizSupport
 #basilisk path
 from Basilisk import __path__
 bskPath = __path__[0]
+
+# Plotting functions
+def plot_attitude_error( timeData, dataSigmaBR):
+    """Plot the attitude result."""
+    plt.figure(1)
+    fig = plt.gcf()
+    ax = fig.gca()
+    vectorData = dataSigmaBR
+    sNorm = np.array([np.linalg.norm(v) for v in vectorData])
+    plt.plot( timeData, sNorm,
+             color=unitTestSupport.getLineColor(1, 3),
+             )
+    plt.xlabel('Time [min]')
+    plt.ylabel(r'Attitude Error Norm $|\sigma_{B/R}|$')
+    ax.set_yscale('log')
+
+def plot_control_torque( timeData, dataLr):
+    """Plot the control torque response."""
+    plt.figure(2)
+    for idx in range(3):
+        plt.plot( timeData, dataLr[:, idx],
+                 color=unitTestSupport.getLineColor(idx, 3),
+                 label='$L_{r,' + str(idx) + '}$')
+    plt.legend(loc='lower right')
+    plt.xlabel('Time [min]')
+    plt.ylabel('Control Torque $L_r$ [Nm]')
+
+def plot_rate_error( timeData, dataOmegaBR):
+    """Plot the body angular velocity tracking error."""
+    plt.figure(3)
+    for idx in range(3):
+        plt.plot( timeData, dataOmegaBR[:, idx],
+                 color=unitTestSupport.getLineColor(idx, 3),
+                 label=r'$\omega_{BR,' + str(idx) + '}$')
+    plt.legend(loc='lower right')
+    plt.xlabel('Time [min]')
+    plt.ylabel('Rate Tracking Error [rad/s] ')
+    return
+
+def plot_orientation( timeData, dataPos, dataVel, dataSigmaBN):
+    """Plot the spacecraft orientation."""
+    vectorPosData = dataPos
+    vectorVelData = dataVel
+    vectorMRPData = dataSigmaBN
+    data = np.empty([len(vectorPosData), 3])
+    for idx in range(0, len(vectorPosData)):
+        ir = vectorPosData[idx] / np.linalg.norm(vectorPosData[idx])
+        hv = np.cross(vectorPosData[idx], vectorVelData[idx])
+        ih = hv / np.linalg.norm(hv)
+        itheta = np.cross(ih, ir)
+        dcmBN = RigidBodyKinematics.MRP2C(vectorMRPData[idx])
+        data[idx] = [np.dot(ir, dcmBN[0]), np.dot(itheta, dcmBN[1]), np.dot(ih, dcmBN[2])]
+    plt.figure(4)
+    labelStrings = (r'$\hat\imath_r\cdot \hat b_1$'
+                    , r'${\hat\imath}_{\theta}\cdot \hat b_2$'
+                    , r'$\hat\imath_h\cdot \hat b_3$')
+    for idx in range(3):
+        plt.plot( timeData, data[:, idx],
+                 color=unitTestSupport.getLineColor(idx, 3),
+                 label=labelStrings[idx])
+    plt.legend(loc='lower right')
+    plt.xlabel('Time [min]')
+    plt.ylabel('Orientation Illustration')
+
 
 
 def run(orbit,useSphericalHarmonics,simulationTimeStep,visualisation):
@@ -80,7 +146,7 @@ def run(orbit,useSphericalHarmonics,simulationTimeStep,visualisation):
     scObject = spacecraft.Spacecraft()                                 
     scObject.ModelTag = "Tolo-sat"
     # define the simulation inertia
-    
+    I =[0.037, 0.0, 0.0, 0.0, 0.037, 0.0, 0.0, 0.0, 0.006]
     scObject.hub.IHubPntBc_B = [[0.037, 0.0, 0.0], [0.0, 0.037, 0.0], [0.0, 0.0, 0.006]]
     scObject.hub.mHub = 2.5
     # add spacecraft object to the simulation process
@@ -104,8 +170,51 @@ def run(orbit,useSphericalHarmonics,simulationTimeStep,visualisation):
     sNavObject.ModelTag = "SimpleNavigation"
     scSim.AddModelToTask(dynamicsTaskName, sNavObject,ModelPriority=5)
     
-    #------------------------------------------------------------------#
-    
+    #
+    #   setup the FSW algorithm tasks
+    #
+
+    # setup hillPoint guidance module
+    attGuidance = hillPoint.hillPoint()
+    attGuidance.ModelTag = "hillPoint"
+    attGuidance.transNavInMsg.subscribeTo(sNavObject.transOutMsg)
+    # if you want to connect attGuidance.celBodyInMsg, then you need a planet ephemeris message of
+    # type EphemerisMsgPayload.  In this simulation the input message is not connected to create an empty planet
+    # ephemeris message which puts the earth at (0,0,0) origin with zero speed.
+    CelBodyData = messaging.EphemerisMsgPayload() # make zero'd planet ephemeris message
+    celBodyInMsg = messaging.EphemerisMsg().write(CelBodyData)
+    attGuidance.celBodyInMsg.subscribeTo(celBodyInMsg)
+    scSim.AddModelToTask(dynamicsTaskName, attGuidance)
+
+    # setup the attitude tracking error evaluation module
+    attError = attTrackingError.attTrackingError()
+    attError.ModelTag = "attErrorInertial3D"
+    scSim.AddModelToTask(dynamicsTaskName, attError)
+    attError.sigma_R0R = [0, 1, 0]
+    attError.attRefInMsg.subscribeTo(attGuidance.attRefOutMsg)
+    attError.attNavInMsg.subscribeTo(sNavObject.attOutMsg)
+
+    # setup the MRP Feedback control module
+    mrpControl = mrpFeedback.mrpFeedback()
+    mrpControl.ModelTag = "mrpFeedback"
+    scSim.AddModelToTask(dynamicsTaskName, mrpControl)
+    mrpControl.guidInMsg.subscribeTo(attError.attGuidOutMsg)
+    mrpControl.K = 3.5
+    mrpControl.Ki = -1.0  # make value negative to turn off integral feedback
+    mrpControl.P = 30.0
+    mrpControl.integralLimit = 2. / mrpControl.Ki * 0.1
+
+    # the control torque is read in through the messaging system
+    extFTObject = extForceTorque.ExtForceTorque()
+    extFTObject.ModelTag = "externalDisturbance"
+    # use the input flag to determine which external torque should be applied
+    # Note that all variables are initialized to zero.  Thus, not setting this
+    # vector would leave it's components all zero for the simulation.
+    scObject.addDynamicEffector(extFTObject)
+    scSim.AddModelToTask(dynamicsTaskName, extFTObject)
+
+    # connect torque command to external torque effector
+    extFTObject.cmdTorqueInMsg.subscribeTo(mrpControl.cmdTorqueOutMsg)
     
     
     #------------------------------------------------------------------#
@@ -365,7 +474,11 @@ def run(orbit,useSphericalHarmonics,simulationTimeStep,visualisation):
     tamCommLog = tamCommConfig.tamOutMsg.recorder(macros.sec2nano(1.))
     magLog = magModule.envOutMsgs[0].recorder(macros.sec2nano(1.))
     spiceDataLog = gravFactory.spiceObject.planetStateOutMsgs[1].recorder(macros.sec2nano(1.))
-    
+    attErrLog = attError.attGuidOutMsg.recorder(macros.sec2nano(1.))
+    mrpLog = mrpControl.cmdTorqueOutMsg.recorder(macros.sec2nano(1.))
+    snAttLog = sNavObject.attOutMsg.recorder(macros.sec2nano(1.))
+    snTransLog = sNavObject.transOutMsg.recorder(macros.sec2nano(1.))
+
 
     #dataAtmoLog = atmoModule.envOutMsgs[0].recorder(1)
     scSim.AddModelToTask(dynamicsTaskName , dataRec)
@@ -374,6 +487,18 @@ def run(orbit,useSphericalHarmonics,simulationTimeStep,visualisation):
     scSim.AddModelToTask(dynamicsTaskName, magLog)
     scSim.AddModelToTask(dynamicsTaskName,ggLog)
     scSim.AddModelToTask(dynamicsTaskName,spiceDataLog)
+    scSim.AddModelToTask(dynamicsTaskName, mrpLog)
+    scSim.AddModelToTask(dynamicsTaskName, attErrLog)
+    scSim.AddModelToTask(dynamicsTaskName, snAttLog)
+    scSim.AddModelToTask(dynamicsTaskName, snTransLog)
+
+    # create the FSW vehicle configuration message
+    vehicleConfigOut = messaging.VehicleConfigMsgPayload()
+    vehicleConfigOut.ISCPntB_B = I  # use the same inertia in the FSW algorithm as in the simulation
+    configDataMsg = messaging.VehicleConfigMsg().write(vehicleConfigOut)
+    mrpControl.vehConfigInMsg.subscribeTo(configDataMsg)
+
+
     
     
     #scSim.AddModelToTask(dynamicsTaskName, dataAtmoLog)
@@ -394,12 +519,16 @@ def run(orbit,useSphericalHarmonics,simulationTimeStep,visualisation):
     
     scSim.ExecuteSimulation()
     
- 
-   
 
     timeData = dataRec.times() * macros.NANO2MIN
     dragBodyData = scSim.GetLogVariableData(scDrag.ModelTag+".forceExternal_B")
     srpForceData = scSim.GetLogVariableData(srp.ModelTag+".forceExternal_N")
+    dataLr = mrpLog.torqueRequestBody
+    dataSigmaBR = attErrLog.sigma_BR
+    dataOmegaBR = attErrLog.omega_BR_B
+    dataPos = snTransLog.r_BN_N
+    dataVel = snTransLog.v_BN_N
+    dataSigmaBN = snAttLog.sigma_BN
     
     print("sunName = ",theSun.planetName)
     print(ggLog.gravityGradientTorque_B.shape)
@@ -417,6 +546,16 @@ def run(orbit,useSphericalHarmonics,simulationTimeStep,visualisation):
     plotSpicePlanetData(timeData,spiceDataLog,num)
     num+=1
     plotSRPEffector(timeData,srpForceData,num)
+
+    plot_attitude_error( timeData, dataSigmaBR)
+    num+=1
+
+    plot_control_torque( timeData, dataLr)
+    
+    plot_rate_error( timeData, dataOmegaBR)
+    num+=1
+    plot_orientation( timeData, dataPos, dataVel, dataSigmaBN) 
+    num+=1
     
     scSim.ShowExecutionFigure(True)
     
@@ -447,9 +586,10 @@ if __name__ == "__main__":
                   omega= 90 * macros.D2R,
                   ta = 0.1 * macros.D2R
                 )
+    
     run(
         orbit,
-        1.0, # time step (s)
         True,# useSphericalHarmonics
+        1.0, # time step (s)
         False # liveStream
     )
